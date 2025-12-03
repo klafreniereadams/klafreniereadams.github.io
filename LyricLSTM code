@@ -1,0 +1,474 @@
+import os
+#Importation of Kaggle 'Spotify Million Song Dataset'
+########### Copilot helped me write some statements to fix the python crashing I was experiencing ####################
+
+# Disable oneDNN CPU optimizations (known to cause segfaults on mac arm64 in some setups)
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+# Force tf.keras legacy behavior (reduces Keras 3 / tf 2.x ABI surprises)
+os.environ["TF_USE_LEGACY_KERAS"] = "1"
+# Make TF logs quieter (optional)
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+# Keep threading minimal (we also set these inside TF later, but harmless here)
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["KMP_BLOCKTIME"] = "0"
+
+print("Environment flags set.")
+
+#######################################################################################################################
+
+import opendatasets as od
+import pandas as pd
+import kaggle
+import tensorflow as tf
+import tensorflow.keras
+from tensorflow.keras import layers
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout, LSTM, Masking 
+from tensorflow.keras.optimizers import Adam
+
+od.download("https://www.kaggle.com/datasets/notshrirang/spotify-million-song-dataset")
+
+#print(os.listdir("spotify-million-song-dataset"))
+
+import re #regex
+import pandas as pd
+
+csv_path = "spotify-million-song-dataset/spotify_millsongdata.csv"
+df = pd.read_csv(csv_path, usecols=['text'])
+
+#print(df.columns)
+
+lyrics = df["text"].dropna().tolist()
+print("Number of songs whose lyrics we have:", len(lyrics))
+
+cleaned_lyrics = []
+for lyric in lyrics:
+    lyric = lyric.lower()
+    lyric = re.sub(r"[^\w\s'-]", " ", lyric) # Replace any character that's NOT a letter, digit, underscore, whitespace, apostrophe, or in-word hyphen
+    lyric = re.sub(r"\s-\s", " ", lyric) # but remove hyphens that are clausal
+    lyric = " ".join(lyric.split()) #remove excess white space
+    cleaned_lyrics.append(lyric) #add the cleaned text to empty cleaned_lyrics list
+
+# Join lyrics into one big text string. Add "Song End" separators
+separator = "\n<SONG_END>\n"
+all_text = separator.join(cleaned_lyrics)
+
+# Dump all cleaned lyrics into .txt file for tokenizing
+output_path = "lyrics_corpus.txt"
+with open(output_path, "w", encoding="utf-8") as f:
+    f.write(all_text)
+
+# BPE (byte-pair encoding) as our tokenizer
+# elegantly handles slang or rare vocabulary. Easier on CPU RAM.
+
+#BPE using Google SentencePiece
+pip install sentencepiece
+import sentencepiece as spm
+
+################## Code borrowed from https://colab.research.google.com/github/google/sentencepiece/blob/master/python/sentencepiece_python_module_example.ipynb
+
+# train sentencepiece model from `lyrics_corpus.txt` and makes `m.model` and `m.vocab`
+# `m.vocab` is just a reference. not explicitly used in the segmentation
+spm.SentencePieceTrainer.train(
+    '--input=lyrics_corpus.txt '
+    '--model_prefix=m '
+    '--vocab_size=5000 '
+    '--model_type=bpe '
+    '--character_coverage=0.9995 '
+    '--pad_id=3 --pad_piece=<pad> '
+    '--user_defined_symbols=<SONG_END> '
+    '--shuffle_input_sentence=true '
+    '--input_sentence_size=50000 '
+    '--num_threads=4'
+)
+
+# Load the trained model
+sp = spm.SentencePieceProcessor(model_file='m.model')
+
+PAD_ID = sp.pad_id()   # we set this as 3
+UNK_ID = sp.unk_id()   # typically 0
+BOS_ID = sp.bos_id()   # 1
+EOS_ID = sp.eos_id()   # 2
+
+######## Faster batched encoding #########
+
+import os
+import json
+import time
+import hashlib
+from tqdm import tqdm
+import sentencepiece as spm
+
+MODEL_PATH = "m.model"
+OUT_PATH   = "encoded_lyrics_20k.jsonl"
+TARGET_COUNT = 20_000
+
+def stable_hash(s, buckets=10_000_000):
+    return int(hashlib.sha256(s.encode("utf-8")).hexdigest(), 16) % buckets
+
+def sample_20k(cleaned_lyrics):
+    indexed = [(stable_hash(s), i, s) for i, s in enumerate(cleaned_lyrics)]
+    indexed.sort(key=lambda x: x[0])
+    return [s for _, _, s in indexed[:TARGET_COUNT]]
+
+############# Fast load of the 20k encoded subset from JSONL with tqdm progress ###############
+import json
+from tqdm import tqdm
+
+OUT_PATH = "encoded_lyrics_20k.jsonl"
+
+# Block read, then parse with a visible progress bar
+with open(OUT_PATH, "r", encoding="utf-8") as f:
+    lines = [ln for ln in f.read().splitlines() if ln]
+
+encoded_lyrics_20k = []
+for ln in tqdm(lines, desc="Parsing JSONL", unit="song"):
+    encoded_lyrics_20k.append(json.loads(ln))
+
+print("Loaded", len(encoded_lyrics_20k), "encoded songs from", OUT_PATH)
+
+# Create train_small & val_small because using full dataset causes cell to hang
+import hashlib
+
+OUT_PATH = "encoded_lyrics_20k.jsonl"
+#assert os.path.exists(OUT_PATH), f"Missing file: {OUT_PATH}"
+
+train_ratio   = 0.95
+SPLIT_BUCKETS = 1_000_000
+SPLIT_SALT    = "split"
+threshold     = int(train_ratio * SPLIT_BUCKETS)
+
+def stable_hash(s: str, buckets: int, salt: str = "") -> int:
+    import hashlib
+    h = hashlib.sha256((salt + s).encode("utf-8")).hexdigest()
+    return int(h, 16) % buckets
+
+target_train = 300   # small quotas so it finishes faster
+target_val   = 30
+
+train_small, val_small = [], []
+with open(OUT_PATH, "r", encoding="utf-8", errors="ignore") as f:
+    for ln in tqdm(f, desc="Subset split progress", unit="line"):
+        raw_ln = ln  # keep original for hashing
+        ln = ln.strip()
+        if not ln:
+            continue
+        bucket = stable_hash(raw_ln, SPLIT_BUCKETS, SPLIT_SALT)
+        if bucket < threshold and len(train_small) < target_train:
+            train_small.append(json.loads(ln))
+        elif bucket >= threshold and len(val_small) < target_val:
+            val_small.append(json.loads(ln))
+        if len(train_small) >= target_train and len(val_small) >= target_val:
+            break
+
+print(f"Subset creation complete. train_small={len(train_small)} val_small={len(val_small)}")
+
+#print(type(val_small[0]), val_small[0])
+
+# Build validation windows using smaller dataset
+import os
+import numpy as np
+import tensorflow as tf
+from tqdm import tqdm
+
+print("SentencePiece setup", flush=True)
+
+MODEL_PATH = "m.model"
+PAD_ID = None
+vocab_size = None
+sp = None  # keep reference if it loads
+
+def estimate_vocab_from_json_lists(lists, sample=300):
+    max_id = 0
+    for seq in lists[:sample]:
+       if isinstance(seq, (list, tuple)) and seq:
+            m = max(seq)
+            if m > max_id:
+                max_id = m
+    return max_id + 1 
+
+sp = None
+PAD_ID = 0
+vocab_size = max(estimate_vocab_from_json_lists(train_small),
+                 estimate_vocab_from_json_lists(val_small))
+print(f"[SP] Forced fallback PAD_ID={PAD_ID}, estimated vocab_size={vocab_size}")
+
+print("Building validation windows", flush=True)
+
+# Minimal NumPy pad (avoid tf.keras.preprocessing.pad_sequences)
+def pad_sequences_np(seqs, maxlen, pad_value):
+    arr = np.full((len(seqs), maxlen), pad_value, dtype=np.int32)
+    for i, seq in enumerate(seqs):
+        L = min(len(seq), maxlen)
+        arr[i, :L] = seq[:L]
+    return arr
+
+# build validation sliding windows
+def build_val_windows(songs_ids, window_size=30, max_windows_per_song=1, pad_id=0):
+    X, y = [], []
+    # outer loop tqdm
+    for lyric in tqdm(songs_ids, desc="Building windows", unit="song"):
+        L = len(lyric)
+        if L <= window_size:
+            continue
+        limit = min(L - window_size, max_windows_per_song)
+        for i in range(limit):
+            X.append(lyric[i:i + window_size])
+            y.append(lyric[i + window_size])
+    X = pad_sequences_np(X, maxlen=window_size, pad_value=pad_id)
+    y = np.array(y, dtype=np.int32)
+    return X, y
+
+window_size = 30
+batch_size  = 8
+
+print("train_small length:", len(train_small))
+print("val_small length:", len(val_small))
+
+X_val, y_val = build_val_windows(val_small[:100], window_size=window_size, pad_id=PAD_ID)
+print("Val set:", X_val.shape, y_val.shape, flush=True)
+
+# Build dataset back and train model
+import numpy as np
+import random
+import tensorflow as tf
+
+# --- NumPy pad helper (used inside the Sequence) ---
+def pad_sequences_np(seqs, maxlen, pad_value):
+    arr = np.full((len(seqs), maxlen), pad_value, dtype=np.int32)
+    for i, seq in enumerate(seqs):
+        L = min(len(seq), maxlen)
+        arr[i, :L] = seq[:L]
+    return arr
+
+class LyricsSequence(tf.keras.utils.Sequence):
+    def __init__(self, songs, batch_size, window_size, pad_id, steps=10, seed=1234):
+        self.songs = songs
+        self.batch_size = batch_size
+        self.window_size = window_size
+        self.pad_id = pad_id
+        self.steps = steps
+        self.rng = random.Random(seed)
+
+    def __len__(self):
+        return self.steps
+
+    def __getitem__(self, idx):
+        Xb, yb = [], []
+        while len(Xb) < self.batch_size:
+            lyric = self.rng.choice(self.songs)
+            L = len(lyric)
+            if L <= self.window_size:
+                continue
+            i = self.rng.randint(0, L - self.window_size - 1)
+            Xb.append(lyric[i:i + self.window_size])
+            yb.append(lyric[i + self.window_size])
+        Xb = pad_sequences_np(Xb, maxlen=self.window_size, pad_value=self.pad_id)
+        yb = np.array(yb, dtype=np.int32)
+        
+        special_tokens = [PAD_ID, UNK_ID]
+        sample_weight = np.where(np.isin(yb, special_tokens), 0.0, 1.0)
+
+        return Xb, yb, sample_weight
+
+# Use the window_size/PAD_ID/vocab_size you already have
+train_seq = LyricsSequence(train_small, batch_size=15, window_size=30, pad_id=PAD_ID, steps=30)
+
+tf.keras.backend.clear_session()
+
+#In the Embedding layer, had to turn mask_zero off so it doesn't default map MASK tokens to 0, which is what I've mapped PAD to.
+#I would fix this in future work.
+
+LyricLSTM = tf.keras.Sequential([
+    tf.keras.layers.Embedding(input_dim=vocab_size, output_dim=256, mask_zero=False),
+    tf.keras.layers.LSTM(256, dropout=0.2, recurrent_dropout=0.2, return_sequences=True), 
+    #return_sequences=True makes output stay 3D, which is what 2nd LSTM layer expects
+    tf.keras.layers.Dropout(0.2),
+    tf.keras.layers.LSTM(256, recurrent_dropout=0.2),
+    tf.keras.layers.Dense(vocab_size, activation='softmax')
+])
+LyricLSTM.compile(
+    loss=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=False),
+    optimizer='adam',
+    metrics=['accuracy']
+)
+
+print("Starting fit...")
+
+Hist = LyricLSTM.fit(
+    train_seq,
+    epochs=100,
+    validation_data=(X_val, y_val),  # <-- uses the NumPy-prepared validation arrays
+    verbose=1
+)
+LyricLSTM.summary()
+print("Training done.")
+LyricLSTM.save("LyricLSTM_full.keras")  # Keras recommended format
+
+print("Trained model saved as LyricLSTM_full.keras")
+
+################# Visualizations ####################
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# a visualization for the Accuracy over all epochs
+Train_Accuracy = Hist.history['accuracy']
+Test_Accuracy = Hist.history['val_accuracy']
+
+epochs = range(1, len(Train_Accuracy) + 1)
+
+plt.figure(figsize=(6, 5))
+plt.plot(epochs, Train_Accuracy, 'b-', label='Training Accuracy')
+plt.plot(epochs, Test_Accuracy, 'g-', label='Test Accuracy')
+plt.title('Accuracy over Epochs')
+plt.xlabel('Epochs')
+plt.ylabel('Accuracy')
+plt.xticks(range(0, len(Train_Accuracy)+1, 5))  # every 5 epochs
+#plt.yticks([0.1, 0.2, 0.3, 0.4])  
+plt.legend()
+plt.show()
+
+# a visualization for the Loss over all epochs
+train_loss = Hist.history['loss']
+val_loss = Hist.history['val_loss']
+epochs = range(1, len(train_loss) + 1)
+
+plt.figure(figsize=(6, 5))
+plt.plot(epochs, train_loss, 'b-', label='Training Loss')
+plt.plot(epochs, val_loss, 'g-', label='Validation Loss')
+plt.title('Loss over Epochs')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.xticks(range(0, len(train_loss)+1, 5))  # every 5 epochs
+#plt.yticks([0.1, 0.2, 0.3, 0.4])  
+plt.legend()
+plt.show()
+
+######Visualization of Model Perplexity##########
+import math
+
+# Fetch the losses
+train_loss = Hist.history['loss']
+val_loss = Hist.history['val_loss']
+
+# Compute perplexity
+train_ppl = [math.exp(l) for l in train_loss]
+val_ppl = [math.exp(l) for l in val_loss]
+
+# Plot
+plt.figure(figsize=(12,10))
+plt.plot(train_ppl, label='Train PPL', marker='.')
+plt.plot(val_ppl, label='Validation PPL', marker='.')
+plt.yscale('log')  # helpful if values vary widely
+plt.xlabel('Epoch')
+plt.ylabel('Perplexity (log scale)')
+plt.title('LSTM Language Model Perplexity')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.show()
+
+############# Text Prediction #################
+####### Copilot code to keep my kernel from crashing and circumvent MacOS spawn vs fork multiprocessing weirdness
+####### I'm sorry I overcomplicated this and got myself into a hole where I needed AI to help me patch things
+import subprocess, shlex
+
+def sp_encode_ids_cli(model_path, text):
+    cmd = f"spm_encode --model={shlex.quote(model_path)} --output_format=id"
+    p = subprocess.run(shlex.split(cmd), input=text.encode(), stdout=subprocess.PIPE)
+    return [int(token) for token in p.stdout.decode().strip().split()]
+
+def sp_decode_ids_cli(model_path, ids):
+    cmd = f"spm_decode --model={shlex.quote(model_path)} --input_format=id"
+    p = subprocess.run(shlex.split(cmd), input=(" ".join(map(str, ids))).encode(), stdout=subprocess.PIPE)
+    return p.stdout.decode().strip()
+
+# CLI wrappers for SentencePiece
+def sp_encode_ids_cli(model_path, text):
+    cmd = f"spm_encode --model={shlex.quote(model_path)} --output_format=id"
+    p = subprocess.run(shlex.split(cmd), input=text.encode(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if p.returncode != 0:
+        raise RuntimeError(f"spm_encode failed: {p.stderr.decode(errors='ignore')}")
+    return [int(token) for token in p.stdout.decode().strip().split()]
+
+def sp_vocab_size_cli(model_path="m.model"):
+    cmd = f"spm_export_vocab --model={shlex.quote(model_path)}"
+    p = subprocess.run(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if p.returncode != 0:
+        raise RuntimeError(f"spm_export_vocab failed: {p.stderr.decode(errors='ignore')}")
+    return sum(1 for _ in p.stdout.decode().splitlines())
+##########
+
+# Special token IDs
+UNK_ID = 0
+PAD_ID = 3
+SPECIALS = {UNK_ID, 1, 2, PAD_ID}  # unk, bos, eos, pad
+VOCAB_SIZE = sp_vocab_size_cli("m.model")
+
+# Sanitization helper
+def sanitize_ids(ids, vocab_size=VOCAB_SIZE, specials=SPECIALS):
+    return [UNK_ID if i < 0 or i >= vocab_size else i for i in ids if i not in specials]
+
+# Sampling helpers
+def sample_argmax(probs):
+    return int(np.argmax(probs))
+
+def sample_temperature(probs, temperature=1.0):
+    logits = np.log(np.clip(probs, 1e-12, 1.0))
+    logits = logits / max(temperature, 1e-6)
+    exp = np.exp(logits - np.max(logits))
+    p = exp / exp.sum()
+    return int(np.random.choice(len(p), p=p))
+
+def sample_top_k(probs, k=10, temperature=1.0): # had to add this because the model kept predicting token_id=0 (PAD) over and over
+    probs = np.asarray(probs).astype('float64')
+    logits = np.log(np.clip(probs, 1e-12, 1.0)) / max(temperature, 1e-6)
+    exp_logits = np.exp(logits - np.max(logits))
+    probs = exp_logits / exp_logits.sum()
+
+    top_k_indices = np.argsort(probs)[-k:]
+    top_k_probs = probs[top_k_indices]
+    top_k_probs /= top_k_probs.sum()
+    return int(np.random.choice(top_k_indices, p=top_k_probs))
+
+
+# Load the model again
+LyricLSTM = keras.models.load_model("LyricLSTM_full.keras", compile=False)
+
+# Define how to generate lyrics
+def generate_lyrics(seed_text, window_size=30, pad_id=PAD_ID, max_steps=20,
+                    sampler="argmax", temperature=1.0, top_k=10):
+    context_ids = sp_encode_ids_cli("m.model", seed_text)
+    generated_ids = []
+
+    if sampler == "argmax":
+        choose = sample_argmax
+    elif sampler == "temperature":
+        choose = lambda p: sample_temperature(p, temperature)
+    elif sampler == "topk":
+        choose = lambda p: sample_top_k(p, k=top_k, temperature=temperature)
+    else:
+        raise ValueError("Unknown sampler type")
+
+    for _ in range(max_steps):
+        ctx = context_ids[-window_size:]
+        pad_len = window_size - len(ctx)
+        x = tf.constant([([pad_id] * pad_len) + ctx], dtype=tf.int32)
+
+        y = LyricLSTM(x, training=False)
+        probs = y[0].numpy()  # last timestep
+        next_id = choose(probs)
+
+        generated_ids.append(next_id)
+        context_ids.append(next_id)
+
+    clean_ids = sanitize_ids(generated_ids)
+    decoded_text = sp_decode_ids_cli("m.model", clean_ids)
+
+    return decoded_text, generated_ids, clean_ids
+
+print("Top-k sampling done.")
+
+text, ids, clean = generate_lyrics("love", sampler="topk", temperature=6, top_k=17) #seed word can be anything
+print(text)
+
+
